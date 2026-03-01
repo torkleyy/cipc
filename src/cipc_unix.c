@@ -10,6 +10,10 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+static void lerror(const char *msg) {
+  fprintf(stderr, "%s\n", msg);
+}
+
 static int fmt_sockaddr(struct sockaddr_un *addr, cipc_endpoint e) {
   memset(addr, 0, sizeof(struct sockaddr_un));
   addr->sun_family = AF_UNIX;
@@ -17,7 +21,7 @@ static int fmt_sockaddr(struct sockaddr_un *addr, cipc_endpoint e) {
   int ret = snprintf(addr->sun_path, sizeof(addr->sun_path), "/tmp/ipc_%d_%s",
                      e.pid, e.name);
   if (ret >= (int)sizeof(addr->sun_path)) {
-    perror("file name too long");
+    lerror("file name too long");
     return 0;
   }
 
@@ -41,9 +45,13 @@ static int bind_force_stale(int fd, const struct sockaddr_un *addr) {
 
     // socket file already exists, let's check if it's a corpse
     int probe = socket(PF_LOCAL, SOCK_STREAM, 0);
+    if (probe < 0) {
+      perror("socket");
+      return 0;
+    }
     int connect_ret = connect(probe, saddr, addrsize);
     if (connect_ret == 0) {
-      perror("service appears to be running already");
+      lerror("service appears to be running already");
       close(probe);
       return 0;
     }
@@ -58,8 +66,7 @@ static int bind_force_stale(int fd, const struct sockaddr_un *addr) {
     close(probe);
   }
 
-  fprintf(stderr,
-          "looks like multiple processes are racing for this socket file\n");
+  lerror("looks like multiple processes are racing for this socket file");
   return 0;
 }
 
@@ -87,6 +94,7 @@ cipc_listener *cipc_create_listener(cipc_endpoint endpoint, cipc_flags flags) {
   if (ret == -1) {
     perror("listen");
     close(fd);
+    unlink(addr.sun_path);
     return NULL;
   }
 
@@ -97,6 +105,7 @@ cipc_listener *cipc_create_listener(cipc_endpoint endpoint, cipc_flags flags) {
   cipc_listener *listener = malloc(sizeof(cipc_listener));
   if (!listener) {
     close(fd);
+    unlink(addr.sun_path);
     return NULL;
   }
 
@@ -120,10 +129,10 @@ struct cipc_stream {
 
 cipc_stream *cipc_accept(cipc_listener *listener, cipc_flags flags) {
   struct sockaddr addr;
-  socklen_t addrlen;
+  socklen_t addrlen = sizeof(addr);
   int fd = accept(listener->fd, &addr, &addrlen);
   if (fd == -1) {
-    perror("accept");
+    if (errno != EWOULDBLOCK && errno != EAGAIN) perror("accept");
     return NULL;
   }
 
@@ -132,6 +141,10 @@ cipc_stream *cipc_accept(cipc_listener *listener, cipc_flags flags) {
   }
 
   cipc_stream *stream = malloc(sizeof(cipc_stream));
+  if (!stream) {
+    close(fd);
+    return NULL;
+  }
   stream->fd = fd;
 
   return stream;
@@ -145,6 +158,11 @@ cipc_stream *cipc_connect(cipc_endpoint endpoint, cipc_flags flags) {
   int fd = socket(PF_LOCAL, SOCK_STREAM, 0);
   if (fd == -1)
     return NULL;
+
+  if (flags & cipc_flag_nonblocking) {
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+  }
+
   int ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
 
   if (ret == -1) {
@@ -153,11 +171,11 @@ cipc_stream *cipc_connect(cipc_endpoint endpoint, cipc_flags flags) {
     return NULL;
   }
 
-  if (flags & cipc_flag_nonblocking) {
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-  }
-
   cipc_stream *stream = malloc(sizeof(cipc_stream));
+  if (!stream) {
+    close(fd);
+    return NULL;
+  }
   stream->fd = fd;
 
   return stream;
